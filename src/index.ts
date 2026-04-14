@@ -6,6 +6,7 @@ import {
   ListToolsRequestSchema,
   isInitializeRequest,
 } from "@modelcontextprotocol/sdk/types.js";
+import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
 import { randomUUID } from "node:crypto";
@@ -356,6 +357,7 @@ async function startStdio() {
 
 async function startHttp() {
   const app = express();
+  app.use(cors());
   app.use(express.json());
 
   // Session → transport map
