@@ -1,12 +1,13 @@
 {
   "name": "discord-mcp-server",
-  "version": "1.0.0",
-  "description": "Discord MCP server for integrating Discord with Claude",
+  "version": "1.1.0",
+  "description": "Discord MCP server for integrating Discord with Claude (stdio + remote HTTP)",
   "type": "module",
   "main": "build/index.js",
   "scripts": {
     "build": "tsc",
     "start": "node build/index.js",
+    "start:http": "MCP_TRANSPORT=http node build/index.js",
     "dev": "tsc -w",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
@@ -18,12 +19,14 @@
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.2.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "discord.js": "^14.14.1",
     "dotenv": "^16.4.7",
+    "express": "^5.2.1",
     "zod": "^3.22.4"
   },
   "devDependencies": {
+    "@types/express": "^5.0.6",
     "@types/node": "^20.11.16",
     "typescript": "^5.3.3"
   }

@@ -1,144 +1,210 @@
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import dotenv from 'dotenv';
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  isInitializeRequest,
 } from "@modelcontextprotocol/sdk/types.js";
-import { Client, GatewayIntentBits, TextChannel } from 'discord.js';
-import { z } from 'zod';
+import dotenv from "dotenv";
+import express from "express";
+import { randomUUID } from "node:crypto";
+import {
+  Client,
+  GatewayIntentBits,
+  TextChannel,
+  User,
+  DMChannel,
+  Partials,
+} from "discord.js";
+import { z } from "zod";
 
 // Load environment variables
 dotenv.config();
 
-// Discord client setup
+// ─── Config ──────────────────────────────────────────────
+const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+const SENDER_NAME = process.env.SENDER_NAME || "";
+const MCP_TRANSPORT = (process.env.MCP_TRANSPORT || "stdio").toLowerCase();
+const MCP_PORT = parseInt(process.env.MCP_PORT || "3100", 10);
+
+if (!DISCORD_TOKEN) {
+  console.error("DISCORD_TOKEN environment variable is not set");
+  process.exit(1);
+}
+
+// ─── Discord Client ──────────────────────────────────────
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.DirectMessages,
   ],
+  partials: [Partials.Channel], // Required for DM support
 });
 
-// Helper function to find a guild by name or ID
+// ─── Helpers ─────────────────────────────────────────────
+
+/** Prepend sender name to message if configured */
+function prependSenderName(message: string, senderNameOverride?: string): string {
+  const name = senderNameOverride || SENDER_NAME;
+  if (!name) return message;
+  return `【${name}】${message}`;
+}
+
 async function findGuild(guildIdentifier?: string) {
   if (!guildIdentifier) {
-    // If no guild specified and bot is only in one guild, use that
     if (client.guilds.cache.size === 1) {
       return client.guilds.cache.first()!;
     }
-    // List available guilds
     const guildList = Array.from(client.guilds.cache.values())
-      .map(g => `"${g.name}"`).join(', ');
-    throw new Error(`Bot is in multiple servers. Please specify server name or ID. Available servers: ${guildList}`);
+      .map((g) => `"${g.name}"`)
+      .join(", ");
+    throw new Error(
+      `Bot is in multiple servers. Please specify server name or ID. Available servers: ${guildList}`
+    );
   }
 
-  // Try to fetch by ID first
   try {
     const guild = await client.guilds.fetch(guildIdentifier);
     if (guild) return guild;
   } catch {
-    // If ID fetch fails, search by name
     const guilds = client.guilds.cache.filter(
-      g => g.name.toLowerCase() === guildIdentifier.toLowerCase()
+      (g) => g.name.toLowerCase() === guildIdentifier.toLowerCase()
     );
-    
     if (guilds.size === 0) {
-      const availableGuilds = Array.from(client.guilds.cache.values())
-        .map(g => `"${g.name}"`).join(', ');
-      throw new Error(`Server "${guildIdentifier}" not found. Available servers: ${availableGuilds}`);
+      const available = Array.from(client.guilds.cache.values())
+        .map((g) => `"${g.name}"`)
+        .join(", ");
+      throw new Error(
+        `Server "${guildIdentifier}" not found. Available servers: ${available}`
+      );
     }
     if (guilds.size > 1) {
-      const guildList = guilds.map(g => `${g.name} (ID: ${g.id})`).join(', ');
-      throw new Error(`Multiple servers found with name "${guildIdentifier}": ${guildList}. Please specify the server ID.`);
+      const list = guilds.map((g) => `${g.name} (ID: ${g.id})`).join(", ");
+      throw new Error(
+        `Multiple servers found with name "${guildIdentifier}": ${list}. Please specify the server ID.`
+      );
     }
     return guilds.first()!;
   }
   throw new Error(`Server "${guildIdentifier}" not found`);
 }
 
-// Helper function to find a channel by name or ID within a specific guild
-async function findChannel(channelIdentifier: string, guildIdentifier?: string): Promise<TextChannel> {
+async function findChannel(
+  channelIdentifier: string,
+  guildIdentifier?: string
+): Promise<TextChannel> {
   const guild = await findGuild(guildIdentifier);
-  
-  // First try to fetch by ID
+
   try {
     const channel = await client.channels.fetch(channelIdentifier);
     if (channel instanceof TextChannel && channel.guild.id === guild.id) {
       return channel;
     }
   } catch {
-    // If fetching by ID fails, search by name in the specified guild
     const channels = guild.channels.cache.filter(
       (channel): channel is TextChannel =>
         channel instanceof TextChannel &&
         (channel.name.toLowerCase() === channelIdentifier.toLowerCase() ||
-         channel.name.toLowerCase() === channelIdentifier.toLowerCase().replace('#', ''))
+          channel.name.toLowerCase() ===
+            channelIdentifier.toLowerCase().replace("#", ""))
     );
-
     if (channels.size === 0) {
-      const availableChannels = guild.channels.cache
+      const available = guild.channels.cache
         .filter((c): c is TextChannel => c instanceof TextChannel)
-        .map(c => `"#${c.name}"`).join(', ');
-      throw new Error(`Channel "${channelIdentifier}" not found in server "${guild.name}". Available channels: ${availableChannels}`);
+        .map((c) => `"#${c.name}"`)
+        .join(", ");
+      throw new Error(
+        `Channel "${channelIdentifier}" not found in server "${guild.name}". Available channels: ${available}`
+      );
     }
     if (channels.size > 1) {
-      const channelList = channels.map(c => `#${c.name} (${c.id})`).join(', ');
-      throw new Error(`Multiple channels found with name "${channelIdentifier}" in server "${guild.name}": ${channelList}. Please specify the channel ID.`);
+      const list = channels.map((c) => `#${c.name} (${c.id})`).join(", ");
+      throw new Error(
+        `Multiple channels found with name "${channelIdentifier}" in server "${guild.name}": ${list}. Please specify the channel ID.`
+      );
     }
     return channels.first()!;
   }
-  throw new Error(`Channel "${channelIdentifier}" is not a text channel or not found in server "${guild.name}"`);
+  throw new Error(
+    `Channel "${channelIdentifier}" is not a text channel or not found in server`
+  );
 }
 
-// Updated validation schemas
+async function findUser(userIdentifier: string): Promise<User> {
+  // Try fetch by ID first
+  try {
+    const user = await client.users.fetch(userIdentifier);
+    if (user) return user;
+  } catch {
+    // Not a valid ID
+  }
+
+  // Try to find by username across guilds
+  for (const guild of client.guilds.cache.values()) {
+    const members = await guild.members.fetch({ query: userIdentifier, limit: 5 });
+    const match = members.find(
+      (m) =>
+        m.user.username.toLowerCase() === userIdentifier.toLowerCase() ||
+        m.displayName.toLowerCase() === userIdentifier.toLowerCase()
+    );
+    if (match) return match.user;
+  }
+
+  throw new Error(
+    `User "${userIdentifier}" not found. Please provide a valid user ID or exact username.`
+  );
+}
+
+// ─── Zod Schemas ─────────────────────────────────────────
+
 const SendMessageSchema = z.object({
-  server: z.string().optional().describe('Server name or ID (optional if bot is only in one server)'),
+  server: z.string().optional().describe("Server name or ID"),
   channel: z.string().describe('Channel name (e.g., "general") or ID'),
-  message: z.string(),
+  message: z.string().describe("Message content to send"),
+  sender_name: z.string().optional().describe("Override sender name for this message"),
 });
 
 const ReadMessagesSchema = z.object({
-  server: z.string().optional().describe('Server name or ID (optional if bot is only in one server)'),
+  server: z.string().optional().describe("Server name or ID"),
   channel: z.string().describe('Channel name (e.g., "general") or ID'),
   limit: z.number().min(1).max(100).default(50),
 });
 
-// Create server instance
-const server = new Server(
-  {
-    name: "discord",
-    version: "1.0.0",
-  },
-  {
-    capabilities: {
-      tools: {},
-    },
-  }
-);
+const SendDmSchema = z.object({
+  user_id: z.string().describe("Discord user ID or username to send DM to"),
+  message: z.string().describe("Message content to send"),
+  sender_name: z.string().optional().describe("Override sender name for this message"),
+});
 
-// List available tools
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  return {
+const ReadDmSchema = z.object({
+  user_id: z.string().describe("Discord user ID or username to read DMs from"),
+  limit: z.number().min(1).max(100).default(50),
+});
+
+// ─── MCP Server Factory ─────────────────────────────────
+
+function createMcpServer(): Server {
+  const server = new Server(
+    { name: "discord", version: "1.1.0" },
+    { capabilities: { tools: {} } }
+  );
+
+  // ── List Tools ─────────────────────────────────────
+  server.setRequestHandler(ListToolsRequestSchema, async () => ({
     tools: [
       {
         name: "send-message",
         description: "Send a message to a Discord channel",
         inputSchema: {
-          type: "object",
+          type: "object" as const,
           properties: {
-            server: {
-              type: "string",
-              description: 'Server name or ID (optional if bot is only in one server)',
-            },
-            channel: {
-              type: "string",
-              description: 'Channel name (e.g., "general") or ID',
-            },
-            message: {
-              type: "string",
-              description: "Message content to send",
-            },
+            server: { type: "string", description: "Server name or ID (optional if bot is only in one server)" },
+            channel: { type: "string", description: 'Channel name (e.g., "general") or ID' },
+            message: { type: "string", description: "Message content to send" },
+            sender_name: { type: "string", description: "Override sender name (optional, uses SENDER_NAME env if omitted)" },
           },
           required: ["channel", "message"],
         },
@@ -147,109 +213,236 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         name: "read-messages",
         description: "Read recent messages from a Discord channel",
         inputSchema: {
-          type: "object",
+          type: "object" as const,
           properties: {
-            server: {
-              type: "string",
-              description: 'Server name or ID (optional if bot is only in one server)',
-            },
-            channel: {
-              type: "string",
-              description: 'Channel name (e.g., "general") or ID',
-            },
-            limit: {
-              type: "number",
-              description: "Number of messages to fetch (max 100)",
-              default: 50,
-            },
+            server: { type: "string", description: "Server name or ID (optional if bot is only in one server)" },
+            channel: { type: "string", description: 'Channel name (e.g., "general") or ID' },
+            limit: { type: "number", description: "Number of messages to fetch (max 100)", default: 50 },
           },
           required: ["channel"],
         },
       },
+      {
+        name: "send-dm",
+        description: "Send a direct message (DM) to a Discord user",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            user_id: { type: "string", description: "Discord user ID or username" },
+            message: { type: "string", description: "Message content to send" },
+            sender_name: { type: "string", description: "Override sender name (optional)" },
+          },
+          required: ["user_id", "message"],
+        },
+      },
+      {
+        name: "read-dm",
+        description: "Read recent direct messages (DM) with a Discord user",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            user_id: { type: "string", description: "Discord user ID or username" },
+            limit: { type: "number", description: "Number of messages to fetch (max 100)", default: 50 },
+          },
+          required: ["user_id"],
+        },
+      },
     ],
-  };
-});
+  }));
 
-// Handle tool execution
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+  // ── Call Tool ───────────────────────────────────────
+  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params;
 
-  try {
-    switch (name) {
-      case "send-message": {
-        const { channel: channelIdentifier, message } = SendMessageSchema.parse(args);
-        const channel = await findChannel(channelIdentifier);
-        
-        const sent = await channel.send(message);
-        return {
-          content: [{
-            type: "text",
-            text: `Message sent successfully to #${channel.name} in ${channel.guild.name}. Message ID: ${sent.id}`,
-          }],
-        };
+    try {
+      switch (name) {
+        // ── send-message ──────────────────────────
+        case "send-message": {
+          const { channel: chId, message, sender_name, server: srv } =
+            SendMessageSchema.parse(args);
+          const channel = await findChannel(chId, srv);
+          const finalMsg = prependSenderName(message, sender_name);
+          const sent = await channel.send(finalMsg);
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Message sent to #${channel.name} in ${channel.guild.name}. Message ID: ${sent.id}`,
+              },
+            ],
+          };
+        }
+
+        // ── read-messages ─────────────────────────
+        case "read-messages": {
+          const { channel: chId, limit, server: srv } =
+            ReadMessagesSchema.parse(args);
+          const channel = await findChannel(chId, srv);
+          const messages = await channel.messages.fetch({ limit });
+          const formatted = Array.from(messages.values()).map((msg) => ({
+            channel: `#${channel.name}`,
+            server: channel.guild.name,
+            author: msg.author.tag,
+            content: msg.content,
+            timestamp: msg.createdAt.toISOString(),
+          }));
+          return {
+            content: [{ type: "text", text: JSON.stringify(formatted, null, 2) }],
+          };
+        }
+
+        // ── send-dm ───────────────────────────────
+        case "send-dm": {
+          const { user_id, message, sender_name } = SendDmSchema.parse(args);
+          const user = await findUser(user_id);
+          const finalMsg = prependSenderName(message, sender_name);
+          const dmChannel = await user.createDM();
+          const sent = await dmChannel.send(finalMsg);
+          return {
+            content: [
+              {
+                type: "text",
+                text: `DM sent to ${user.tag} (${user.id}). Message ID: ${sent.id}`,
+              },
+            ],
+          };
+        }
+
+        // ── read-dm ───────────────────────────────
+        case "read-dm": {
+          const { user_id, limit } = ReadDmSchema.parse(args);
+          const user = await findUser(user_id);
+          const dmChannel = await user.createDM();
+          const messages = await dmChannel.messages.fetch({ limit });
+          const formatted = Array.from(messages.values()).map((msg) => ({
+            author: msg.author.tag,
+            content: msg.content,
+            timestamp: msg.createdAt.toISOString(),
+            isBot: msg.author.bot,
+          }));
+          return {
+            content: [{ type: "text", text: JSON.stringify(formatted, null, 2) }],
+          };
+        }
+
+        default:
+          throw new Error(`Unknown tool: ${name}`);
       }
-
-      case "read-messages": {
-        const { channel: channelIdentifier, limit } = ReadMessagesSchema.parse(args);
-        const channel = await findChannel(channelIdentifier);
-        
-        const messages = await channel.messages.fetch({ limit });
-        const formattedMessages = Array.from(messages.values()).map(msg => ({
-          channel: `#${channel.name}`,
-          server: channel.guild.name,
-          author: msg.author.tag,
-          content: msg.content,
-          timestamp: msg.createdAt.toISOString(),
-        }));
-
-        return {
-          content: [{
-            type: "text",
-            text: JSON.stringify(formattedMessages, null, 2),
-          }],
-        };
+    } catch (error) {
+      if (error instanceof z.ZodError) {
+        throw new Error(
+          `Invalid arguments: ${error.errors
+            .map((e) => `${e.path.join(".")}: ${e.message}`)
+            .join(", ")}`
+        );
       }
-
-      default:
-        throw new Error(`Unknown tool: ${name}`);
+      throw error;
     }
-  } catch (error) {
-    if (error instanceof z.ZodError) {
-      throw new Error(
-        `Invalid arguments: ${error.errors
-          .map((e) => `${e.path.join(".")}: ${e.message}`)
-          .join(", ")}`
-      );
+  });
+
+  return server;
+}
+
+// ─── Transport: stdio ────────────────────────────────────
+
+async function startStdio() {
+  const server = createMcpServer();
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error("Discord MCP Server running on stdio");
+}
+
+// ─── Transport: Streamable HTTP ──────────────────────────
+
+async function startHttp() {
+  const app = express();
+  app.use(express.json());
+
+  // Session → transport map
+  const transports: Record<string, StreamableHTTPServerTransport> = {};
+
+  // Health check
+  app.get("/health", (_req, res) => {
+    res.json({ status: "ok", transport: "http", discord: client.isReady() });
+  });
+
+  // ── POST /mcp ──────────────────────────────────────
+  app.post("/mcp", async (req, res) => {
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    let transport: StreamableHTTPServerTransport;
+
+    if (sessionId && transports[sessionId]) {
+      transport = transports[sessionId];
+    } else if (!sessionId && isInitializeRequest(req.body)) {
+      transport = new StreamableHTTPServerTransport({
+        sessionIdGenerator: () => randomUUID(),
+        onsessioninitialized: (sid) => {
+          transports[sid] = transport;
+        },
+      });
+      transport.onclose = () => {
+        const sid = transport.sessionId;
+        if (sid && transports[sid]) {
+          delete transports[sid];
+        }
+      };
+      const server = createMcpServer();
+      await server.connect(transport);
+    } else {
+      res.status(400).json({ error: "Bad request: no valid session" });
+      return;
     }
-    throw error;
-  }
-});
 
-// Discord client login and error handling
-client.once('ready', () => {
-  console.error('Discord bot is ready!');
-});
+    await transport.handleRequest(req, res, req.body);
+  });
 
-// Start the server
+  // ── GET /mcp (SSE stream) ──────────────────────────
+  app.get("/mcp", async (req, res) => {
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    if (!sessionId || !transports[sessionId]) {
+      res.status(400).json({ error: "Invalid or missing session ID" });
+      return;
+    }
+    await transports[sessionId].handleRequest(req, res);
+  });
+
+  // ── DELETE /mcp (close session) ────────────────────
+  app.delete("/mcp", async (req, res) => {
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    if (!sessionId || !transports[sessionId]) {
+      res.status(400).json({ error: "Invalid or missing session ID" });
+      return;
+    }
+    await transports[sessionId].handleRequest(req, res);
+  });
+
+  app.listen(MCP_PORT, () => {
+    console.error(`Discord MCP Server (HTTP) listening on port ${MCP_PORT}`);
+    console.error(`Endpoint: http://0.0.0.0:${MCP_PORT}/mcp`);
+  });
+}
+
+// ─── Main ────────────────────────────────────────────────
+
 async function main() {
-  // Check for Discord token
-  const token = process.env.DISCORD_TOKEN;
-  if (!token) {
-    throw new Error('DISCORD_TOKEN environment variable is not set');
-  }
-  
-  try {
-    // Login to Discord
-    await client.login(token);
+  // Wait for Discord to be ready
+  await client.login(DISCORD_TOKEN);
+  await new Promise<void>((resolve) => {
+    if (client.isReady()) return resolve();
+    client.once("ready", () => {
+      console.error("Discord bot is ready!");
+      resolve();
+    });
+  });
 
-    // Start MCP server
-    const transport = new StdioServerTransport();
-    await server.connect(transport);
-    console.error("Discord MCP Server running on stdio");
-  } catch (error) {
-    console.error("Fatal error in main():", error);
-    process.exit(1);
+  if (MCP_TRANSPORT === "http") {
+    await startHttp();
+  } else {
+    await startStdio();
   }
 }
 
-main();
+main().catch((err) => {
+  console.error("Fatal error in main():", err);
+  process.exit(1);
+});
