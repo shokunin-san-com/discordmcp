@@ -340,6 +340,7 @@ function createMcpServer(): Server {
           throw new Error(`Unknown tool: ${name}`);
       }
     } catch (error) {
+      console.error(`[MCP TOOL ERROR] tool=${name} error=${error instanceof Error ? error.message : String(error)}`);
       if (error instanceof z.ZodError) {
         throw new Error(
           `Invalid arguments: ${error.errors
@@ -404,12 +405,23 @@ async function startHttp() {
   // ── POST /mcp ──────────────────────────────────────
   app.post("/mcp", async (req, res) => {
     patchAcceptHeader(req);
+    // Debug: log incoming request details
+    console.error(`[MCP POST] session=${req.headers["mcp-session-id"] || "none"} accept=${req.headers["accept"]} body=${JSON.stringify(req.body)?.substring(0, 200)}`);
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
     let transport: StreamableHTTPServerTransport;
 
     if (sessionId && transports[sessionId]) {
       transport = transports[sessionId];
-    } else if (!sessionId && isInitializeRequest(req.body)) {
+    } else if (sessionId && !transports[sessionId]) {
+      // Stale session: tell client to re-initialize
+      res.status(400).json({
+        jsonrpc: "2.0",
+        error: { code: -32000, message: "Session expired. Please reconnect." },
+        id: req.body?.id ?? null,
+      });
+      return;
+    } else if (isInitializeRequest(req.body)) {
+      // Allow initialize with or without session ID
       transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (sid) => {
@@ -436,11 +448,15 @@ async function startHttp() {
   app.get("/mcp", async (req, res) => {
     patchAcceptHeader(req);
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
-    if (!sessionId || !transports[sessionId]) {
-      res.status(400).json({ error: "Invalid or missing session ID" });
-      return;
+    if (sessionId && transports[sessionId]) {
+      await transports[sessionId].handleRequest(req, res);
+    } else {
+      // Return 405 Method Not Allowed for GET without session
+      // This tells claude.ai to use POST instead
+      res.status(405).set("Allow", "POST, DELETE").json({
+        error: "Method Not Allowed: use POST to initialize",
+      });
     }
-    await transports[sessionId].handleRequest(req, res);
   });
 
   // ── DELETE /mcp (close session) ────────────────────
