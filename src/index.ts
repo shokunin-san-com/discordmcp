@@ -166,6 +166,7 @@ const SendMessageSchema = z.object({
   channel: z.string().describe('Channel name (e.g., "general") or ID'),
   message: z.string().describe("Message content to send"),
   sender_name: z.string().optional().describe("Override sender name for this message"),
+  reply_to: z.coerce.string().optional().describe("Message ID to reply to (creates a thread-style reply)"),
 });
 
 const ReadMessagesSchema = z.object({
@@ -206,6 +207,7 @@ function createMcpServer(): Server {
             channel: { type: "string", description: 'Channel name (e.g., "general") or ID' },
             message: { type: "string", description: "Message content to send" },
             sender_name: { type: "string", description: "Override sender name (optional, uses SENDER_NAME env if omitted)" },
+            reply_to: { type: "string", description: "Message ID to reply to (creates a thread-style reply)" },
           },
           required: ["channel", "message"],
         },
@@ -259,11 +261,17 @@ function createMcpServer(): Server {
       switch (name) {
         // ── send-message ──────────────────────────
         case "send-message": {
-          const { channel: chId, message, sender_name, server: srv } =
+          const { channel: chId, message, sender_name, server: srv, reply_to } =
             SendMessageSchema.parse(args);
           const channel = await findChannel(chId, srv);
           const finalMsg = prependSenderName(message, sender_name);
-          const sent = await channel.send(finalMsg);
+          let sent;
+          if (reply_to) {
+            const targetMsg = await channel.messages.fetch(reply_to);
+            sent = await targetMsg.reply(finalMsg);
+          } else {
+            sent = await channel.send(finalMsg);
+          }
           return {
             content: [
               {
@@ -281,6 +289,7 @@ function createMcpServer(): Server {
           const channel = await findChannel(chId, srv);
           const messages = await channel.messages.fetch({ limit });
           const formatted = Array.from(messages.values()).map((msg) => ({
+            id: msg.id,
             channel: `#${channel.name}`,
             server: channel.guild.name,
             author: msg.author.tag,
