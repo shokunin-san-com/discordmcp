@@ -16,8 +16,7 @@
 claude mcp add discord -s user --transport http https://lp.shokunin-san.xyz/mcp
 ```
 
-> **【YOUR_DOMAIN】の部分は管理者（千葉）から共有されたURLに置き換えてください。**
-> ユーザーに「千葉さんから受け取ったMCPサーバーのURLを貼ってください」と聞くこと。
+> URLは既にリモートサーバーに設定済みなので、そのまま実行すること。
 
 ### 2. Claude Desktop への設定
 
@@ -33,8 +32,11 @@ claude mcp add discord -s user --transport http https://lp.shokunin-san.xyz/mcp
 {
   "mcpServers": {
     "discord": {
-      "type": "streamable-http",
-      "url": "https://lp.shokunin-san.xyz/mcp"
+      "command": "npx",
+      "args": [
+        "mcp-remote",
+        "https://lp.shokunin-san.xyz/mcp"
+      ]
     }
   }
 }
@@ -45,12 +47,15 @@ claude mcp add discord -s user --transport http https://lp.shokunin-san.xyz/mcp
 ユーザーに「claude.ai（Web版やスマホアプリ）でも使いたいですか？」と確認する。
 使いたい場合は以下の手順を案内する：
 
-1. https://claude.ai/settings/integrations にアクセス
-2. 「Add more integrations」→「Custom MCP」を選択
-3. 以下を入力：
-   - **Name**: `Discord`
+1. https://claude.ai/settings にアクセス
+2. 左メニューの「**コネクタ**」を開く
+3. 上部バナーの「**カスタマイズに移動**」をクリック
+4. 「**カスタムコネクタを追加**」をクリック
+5. 以下を入力（詳細設定は空欄でOK）：
+   - **名前**: `Discord`
    - **URL**: `https://lp.shokunin-san.xyz/mcp`
-4. 「Save」で保存
+6. 保存する
+7. 同じアカウントでログインしていればスマホアプリにも自動反映される
 
 ### 4. CLAUDE.md にDiscord送信ルールを追記
 
