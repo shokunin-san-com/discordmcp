@@ -368,7 +368,30 @@ async function startStdio() {
 async function startHttp() {
   const app = express();
   app.use(cors());
+
   app.use(express.json());
+
+  // Fix: claude.ai Web sends Accept: application/json only,
+  // but MCP SDK requires both application/json and text/event-stream.
+  // Patch at raw IncomingMessage level so @hono/node-server picks it up.
+  function patchAcceptHeader(req: express.Request): void {
+    const accept = req.headers["accept"] || "";
+    if (!accept.includes("text/event-stream")) {
+      const newAccept = accept
+        ? `${accept}, text/event-stream`
+        : "application/json, text/event-stream";
+      req.headers["accept"] = newAccept;
+      // Also patch rawHeaders for @hono/node-server compatibility
+      const raw = req.rawHeaders;
+      for (let i = 0; i < raw.length; i += 2) {
+        if (raw[i].toLowerCase() === "accept") {
+          raw[i + 1] = newAccept;
+          return;
+        }
+      }
+      raw.push("Accept", newAccept);
+    }
+  }
 
   // Session → transport map
   const transports: Record<string, StreamableHTTPServerTransport> = {};
@@ -380,6 +403,7 @@ async function startHttp() {
 
   // ── POST /mcp ──────────────────────────────────────
   app.post("/mcp", async (req, res) => {
+    patchAcceptHeader(req);
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
     let transport: StreamableHTTPServerTransport;
 
@@ -410,6 +434,7 @@ async function startHttp() {
 
   // ── GET /mcp (SSE stream) ──────────────────────────
   app.get("/mcp", async (req, res) => {
+    patchAcceptHeader(req);
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
     if (!sessionId || !transports[sessionId]) {
       res.status(400).json({ error: "Invalid or missing session ID" });
