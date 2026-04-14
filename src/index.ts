@@ -293,6 +293,7 @@ function createMcpServer(): Server {
             channel: `#${channel.name}`,
             server: channel.guild.name,
             author: msg.author.tag,
+            authorId: msg.author.id,
             content: msg.content,
             timestamp: msg.createdAt.toISOString(),
           }));
