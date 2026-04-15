@@ -189,6 +189,33 @@ const ReadDmSchema = z.object({
   limit: z.number().min(1).max(100).default(50),
 });
 
+const SearchMessagesSchema = z.object({
+  server: z.string().optional().describe("Server name or ID"),
+  query: z.string().describe("Search keyword"),
+  channel: z.string().optional().describe("Channel name or ID to search in (searches all channels if omitted)"),
+  limit: z.number().min(1).max(50).default(20),
+});
+
+const AddReactionSchema = z.object({
+  server: z.string().optional().describe("Server name or ID"),
+  channel: z.string().describe("Channel name or ID"),
+  message_id: z.coerce.string().describe("Message ID to react to"),
+  emoji: z.string().describe("Emoji to add (e.g. 👍, ✅, or custom emoji name)"),
+});
+
+const EditMessageSchema = z.object({
+  server: z.string().optional().describe("Server name or ID"),
+  channel: z.string().describe("Channel name or ID"),
+  message_id: z.coerce.string().describe("Message ID to edit (must be a message sent by this bot)"),
+  new_content: z.string().describe("New message content"),
+});
+
+const DeleteMessageSchema = z.object({
+  server: z.string().optional().describe("Server name or ID"),
+  channel: z.string().describe("Channel name or ID"),
+  message_id: z.coerce.string().describe("Message ID to delete (must be a message sent by this bot)"),
+});
+
 const ListChannelsSchema = z.object({
   server: z.string().optional().describe("Server name or ID"),
 });
@@ -209,7 +236,7 @@ const ListMembersSchema = z.object({
 
 function createMcpServer(): Server {
   const server = new Server(
-    { name: "discord", version: "1.2.0" },
+    { name: "discord", version: "1.3.0" },
     { capabilities: { tools: {} } }
   );
 
@@ -267,6 +294,61 @@ function createMcpServer(): Server {
             limit: { type: "number", description: "Number of messages to fetch (max 100)", default: 50 },
           },
           required: ["user_id"],
+        },
+      },
+      {
+        name: "search-messages",
+        description: "Search messages by keyword across channels",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            server: { type: "string", description: "Server name or ID (optional)" },
+            query: { type: "string", description: "Search keyword" },
+            channel: { type: "string", description: "Channel name or ID to search in (optional, searches all if omitted)" },
+            limit: { type: "number", description: "Max results (max 50)", default: 20 },
+          },
+          required: ["query"],
+        },
+      },
+      {
+        name: "add-reaction",
+        description: "Add an emoji reaction to a message",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            server: { type: "string", description: "Server name or ID (optional)" },
+            channel: { type: "string", description: "Channel name or ID" },
+            message_id: { type: "string", description: "Message ID to react to" },
+            emoji: { type: "string", description: "Emoji to add (e.g. 👍, ✅)" },
+          },
+          required: ["channel", "message_id", "emoji"],
+        },
+      },
+      {
+        name: "edit-message",
+        description: "Edit a message sent by this bot",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            server: { type: "string", description: "Server name or ID (optional)" },
+            channel: { type: "string", description: "Channel name or ID" },
+            message_id: { type: "string", description: "Message ID to edit" },
+            new_content: { type: "string", description: "New message content" },
+          },
+          required: ["channel", "message_id", "new_content"],
+        },
+      },
+      {
+        name: "delete-message",
+        description: "Delete a message sent by this bot",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            server: { type: "string", description: "Server name or ID (optional)" },
+            channel: { type: "string", description: "Channel name or ID" },
+            message_id: { type: "string", description: "Message ID to delete" },
+          },
+          required: ["channel", "message_id"],
         },
       },
       {
@@ -393,6 +475,116 @@ function createMcpServer(): Server {
         }
 
         // ── list-channels ─────────────────────────
+        // ── search-messages ───────────────────────
+        case "search-messages": {
+          const { query, channel: chId, limit, server: srv } =
+            SearchMessagesSchema.parse(args);
+          const guild = await findGuild(srv);
+          const queryLower = query.toLowerCase();
+
+          let channelsToSearch: TextChannel[];
+          if (chId) {
+            channelsToSearch = [await findChannel(chId, srv)];
+          } else {
+            channelsToSearch = Array.from(
+              guild.channels.cache
+                .filter((c): c is TextChannel => c instanceof TextChannel)
+                .values()
+            );
+          }
+
+          const results: Array<{
+            id: string;
+            channel: string;
+            author: string;
+            authorId: string;
+            content: string;
+            timestamp: string;
+          }> = [];
+
+          for (const channel of channelsToSearch) {
+            if (results.length >= limit) break;
+            try {
+              const messages = await channel.messages.fetch({ limit: 100 });
+              for (const msg of messages.values()) {
+                if (results.length >= limit) break;
+                if (msg.content.toLowerCase().includes(queryLower)) {
+                  results.push({
+                    id: msg.id,
+                    channel: `#${channel.name}`,
+                    author: msg.author.tag,
+                    authorId: msg.author.id,
+                    content: msg.content,
+                    timestamp: msg.createdAt.toISOString(),
+                  });
+                }
+              }
+            } catch {
+              // Skip channels we can't read
+            }
+          }
+
+          return {
+            content: [{
+              type: "text",
+              text: results.length > 0
+                ? JSON.stringify(results, null, 2)
+                : `No messages found matching "${query}"`,
+            }],
+          };
+        }
+
+        // ── add-reaction ─────────────────────────
+        case "add-reaction": {
+          const { channel: chId, message_id, emoji, server: srv } =
+            AddReactionSchema.parse(args);
+          const channel = await findChannel(chId, srv);
+          const msg = await channel.messages.fetch(message_id);
+          await msg.react(emoji);
+          return {
+            content: [{
+              type: "text",
+              text: `Reaction ${emoji} added to message ${message_id} in #${channel.name}`,
+            }],
+          };
+        }
+
+        // ── edit-message ─────────────────────────
+        case "edit-message": {
+          const { channel: chId, message_id, new_content, server: srv } =
+            EditMessageSchema.parse(args);
+          const channel = await findChannel(chId, srv);
+          const msg = await channel.messages.fetch(message_id);
+          if (msg.author.id !== client.user?.id) {
+            throw new Error("Can only edit messages sent by this bot");
+          }
+          await msg.edit(new_content);
+          return {
+            content: [{
+              type: "text",
+              text: `Message ${message_id} edited in #${channel.name}`,
+            }],
+          };
+        }
+
+        // ── delete-message ───────────────────────
+        case "delete-message": {
+          const { channel: chId, message_id, server: srv } =
+            DeleteMessageSchema.parse(args);
+          const channel = await findChannel(chId, srv);
+          const msg = await channel.messages.fetch(message_id);
+          if (msg.author.id !== client.user?.id) {
+            throw new Error("Can only delete messages sent by this bot");
+          }
+          await msg.delete();
+          return {
+            content: [{
+              type: "text",
+              text: `Message ${message_id} deleted from #${channel.name}`,
+            }],
+          };
+        }
+
         case "list-channels": {
           const { server: srv } = ListChannelsSchema.parse(args);
           const guild = await findGuild(srv);
