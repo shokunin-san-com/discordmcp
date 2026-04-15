@@ -14,9 +14,12 @@ import {
   Client,
   GatewayIntentBits,
   TextChannel,
+  ThreadChannel,
   User,
   DMChannel,
   Partials,
+  ChannelType,
+  GuildMember,
 } from "discord.js";
 import { z } from "zod";
 
@@ -186,11 +189,27 @@ const ReadDmSchema = z.object({
   limit: z.number().min(1).max(100).default(50),
 });
 
+const ListChannelsSchema = z.object({
+  server: z.string().optional().describe("Server name or ID"),
+});
+
+const ReadThreadSchema = z.object({
+  server: z.string().optional().describe("Server name or ID"),
+  channel: z.string().describe("Channel name or ID where the thread exists"),
+  thread: z.string().describe("Thread name or ID"),
+  limit: z.number().min(1).max(100).default(50),
+});
+
+const ListMembersSchema = z.object({
+  server: z.string().optional().describe("Server name or ID"),
+  limit: z.number().min(1).max(100).default(50),
+});
+
 // ─── MCP Server Factory ─────────────────────────────────
 
 function createMcpServer(): Server {
   const server = new Server(
-    { name: "discord", version: "1.1.0" },
+    { name: "discord", version: "1.2.0" },
     { capabilities: { tools: {} } }
   );
 
@@ -248,6 +267,43 @@ function createMcpServer(): Server {
             limit: { type: "number", description: "Number of messages to fetch (max 100)", default: 50 },
           },
           required: ["user_id"],
+        },
+      },
+      {
+        name: "list-channels",
+        description: "List all text channels in the Discord server",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            server: { type: "string", description: "Server name or ID (optional if bot is only in one server)" },
+          },
+          required: [],
+        },
+      },
+      {
+        name: "read-thread",
+        description: "Read messages from a thread in a Discord channel",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            server: { type: "string", description: "Server name or ID (optional if bot is only in one server)" },
+            channel: { type: "string", description: "Channel name or ID where the thread exists" },
+            thread: { type: "string", description: "Thread name or ID" },
+            limit: { type: "number", description: "Number of messages to fetch (max 100)", default: 50 },
+          },
+          required: ["channel", "thread"],
+        },
+      },
+      {
+        name: "list-members",
+        description: "List members in the Discord server",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            server: { type: "string", description: "Server name or ID (optional if bot is only in one server)" },
+            limit: { type: "number", description: "Number of members to fetch (max 100)", default: 50 },
+          },
+          required: [],
         },
       },
     ],
@@ -330,6 +386,92 @@ function createMcpServer(): Server {
             content: msg.content,
             timestamp: msg.createdAt.toISOString(),
             isBot: msg.author.bot,
+          }));
+          return {
+            content: [{ type: "text", text: JSON.stringify(formatted, null, 2) }],
+          };
+        }
+
+        // ── list-channels ─────────────────────────
+        case "list-channels": {
+          const { server: srv } = ListChannelsSchema.parse(args);
+          const guild = await findGuild(srv);
+          const channels = guild.channels.cache
+            .filter((c) => c.type === ChannelType.GuildText || c.type === ChannelType.GuildForum)
+            .map((c) => ({
+              id: c.id,
+              name: `#${c.name}`,
+              type: c.type === ChannelType.GuildForum ? "forum" : "text",
+              category: c.parent?.name || "none",
+            }))
+            .sort((a, b) => a.name.localeCompare(b.name));
+          return {
+            content: [{ type: "text", text: JSON.stringify(channels, null, 2) }],
+          };
+        }
+
+        // ── read-thread ──────────────────────────
+        case "read-thread": {
+          const { channel: chId, thread: threadId, limit, server: srv } =
+            ReadThreadSchema.parse(args);
+          const channel = await findChannel(chId, srv);
+
+          // Fetch active threads
+          const activeThreads = await channel.threads.fetchActive();
+          const archivedThreads = await channel.threads.fetchArchived();
+          const allThreads = [
+            ...activeThreads.threads.values(),
+            ...archivedThreads.threads.values(),
+          ];
+
+          // Find thread by ID or name
+          const thread = allThreads.find(
+            (t) =>
+              t.id === threadId ||
+              t.name.toLowerCase() === threadId.toLowerCase()
+          );
+
+          if (!thread) {
+            const available = allThreads.map((t) => `"${t.name}" (${t.id})`).join(", ");
+            throw new Error(
+              `Thread "${threadId}" not found in #${channel.name}. Available threads: ${available || "none"}`
+            );
+          }
+
+          const messages = await thread.messages.fetch({ limit });
+          const formatted = Array.from(messages.values()).map((msg) => ({
+            id: msg.id,
+            thread: thread.name,
+            channel: `#${channel.name}`,
+            author: msg.author.tag,
+            authorId: msg.author.id,
+            content: msg.content,
+            timestamp: msg.createdAt.toISOString(),
+          }));
+          return {
+            content: [{ type: "text", text: JSON.stringify(formatted, null, 2) }],
+          };
+        }
+
+        // ── list-members ─────────────────────────
+        case "list-members": {
+          const { server: srv, limit } = ListMembersSchema.parse(args);
+          const guild = await findGuild(srv);
+          // Use cache first, fetch only if cache is empty
+          let members = guild.members.cache;
+          if (members.size === 0) {
+            members = await guild.members.fetch({ limit, time: 10000 });
+          }
+          const sorted = Array.from(members.values()).slice(0, limit);
+          const formatted = sorted.map((m: GuildMember) => ({
+            id: m.id,
+            username: m.user.username,
+            displayName: m.displayName,
+            tag: m.user.tag,
+            isBot: m.user.bot,
+            roles: m.roles.cache
+              .filter((r) => r.name !== "@everyone")
+              .map((r) => r.name),
           }));
           return {
             content: [{ type: "text", text: JSON.stringify(formatted, null, 2) }],
