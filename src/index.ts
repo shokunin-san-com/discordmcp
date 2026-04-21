@@ -37,6 +37,7 @@ const SENDER_NAME = process.env.SENDER_NAME || "";
 const MCP_TRANSPORT = (process.env.MCP_TRANSPORT || "stdio").toLowerCase();
 const MCP_PORT = parseInt(process.env.MCP_PORT || "3100", 10);
 const ENABLE_ADMIN_TOOLS = process.env.ENABLE_ADMIN_TOOLS === "true";
+const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN || "";
 
 if (!DISCORD_TOKEN) {
   console.error("DISCORD_TOKEN environment variable is not set");
@@ -401,7 +402,7 @@ function createMcpServer(): Server {
       },
       {
         name: "read-attachment",
-        description: "Read and extract content from a file attached to a Discord message (PDF/DOCX/XLSX/MD/TXT)",
+        description: "Read and extract content from a file attached to a Discord message (PDF/DOCX/XLSX/PPTX/MD/TXT)",
         inputSchema: {
           type: "object" as const,
           properties: {
@@ -766,8 +767,34 @@ function createMcpServer(): Server {
               extractedText = buffer.toString("utf-8");
               metadata.fileType = ext.toUpperCase();
               break;
+            case "pptx":
+            case "ppt": {
+              const JSZip = (await import("jszip")).default;
+              const zip = await JSZip.loadAsync(buffer);
+              const slideFiles = Object.keys(zip.files)
+                .filter((name) => /ppt\/slides\/slide\d+\.xml$/.test(name))
+                .sort((a, b) => {
+                  const numA = parseInt(a.match(/slide(\d+)/)?.[1] ?? "0");
+                  const numB = parseInt(b.match(/slide(\d+)/)?.[1] ?? "0");
+                  return numA - numB;
+                });
+              const textParts: string[] = [];
+              for (const slideFile of slideFiles) {
+                const xml = await zip.files[slideFile].async("text");
+                const matches = xml.match(/<a:t[^>]*>([^<]+)<\/a:t>/g) ?? [];
+                const slideText = matches.map((m) => m.replace(/<[^>]+>/g, "")).join(" ");
+                if (slideText.trim()) {
+                  const slideNum = slideFile.match(/slide(\d+)/)?.[1];
+                  textParts.push(`=== Slide ${slideNum} ===\n${slideText.trim()}`);
+                }
+              }
+              extractedText = textParts.join("\n\n") || "(テキストコンテンツなし)";
+              metadata.fileType = "PowerPoint";
+              metadata.slides = slideFiles.length;
+              break;
+            }
             default:
-              throw new Error(`Unsupported file type: .${ext}. Supported: PDF, DOCX, XLSX, MD, TXT, CSV, JSON, etc.`);
+              throw new Error(`Unsupported file type: .${ext}. Supported: PDF, DOCX, XLSX, PPTX, MD, TXT, CSV, JSON, etc.`);
           }
 
           return {
@@ -976,10 +1003,33 @@ async function startHttp() {
   // Session → transport map
   const transports: Record<string, StreamableHTTPServerTransport> = {};
 
-  // Health check
+  // Health check (always public, no auth required)
   app.get("/health", (_req, res) => {
     res.json({ status: "ok", transport: "http", discord: client.isReady() });
   });
+
+  // Bearer token auth on /mcp routes only.
+  // When MCP_AUTH_TOKEN is empty, auth is disabled (backward compat for shared bots).
+  // When set, all /mcp requests must present Authorization: Bearer <token>.
+  if (MCP_AUTH_TOKEN) {
+    app.use("/mcp", (req, res, next) => {
+      const header = req.headers["authorization"] || "";
+      const match = /^Bearer\s+(.+)$/i.exec(Array.isArray(header) ? header[0] : header);
+      const provided = match ? match[1].trim() : "";
+      if (provided !== MCP_AUTH_TOKEN) {
+        res.status(401).json({
+          jsonrpc: "2.0",
+          error: { code: -32001, message: "Unauthorized: invalid or missing token" },
+          id: (req.body && typeof req.body === "object" && "id" in req.body) ? (req.body as any).id : null,
+        });
+        return;
+      }
+      next();
+    });
+    console.error(`[auth] MCP_AUTH_TOKEN enabled (length=${MCP_AUTH_TOKEN.length})`);
+  } else {
+    console.error(`[auth] MCP_AUTH_TOKEN not set — /mcp is open (no auth)`);
+  }
 
   // ── POST /mcp ──────────────────────────────────────
   app.post("/mcp", async (req, res) => {
