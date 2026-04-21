@@ -6,10 +6,13 @@ import {
   ListToolsRequestSchema,
   isInitializeRequest,
 } from "@modelcontextprotocol/sdk/types.js";
+import { mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
+import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
 import { randomUUID } from "node:crypto";
+import { InMemoryOAuthProvider } from "./oauth-provider.js";
 import {
   Client,
   GatewayIntentBits,
@@ -37,7 +40,11 @@ const SENDER_NAME = process.env.SENDER_NAME || "";
 const MCP_TRANSPORT = (process.env.MCP_TRANSPORT || "stdio").toLowerCase();
 const MCP_PORT = parseInt(process.env.MCP_PORT || "3100", 10);
 const ENABLE_ADMIN_TOOLS = process.env.ENABLE_ADMIN_TOOLS === "true";
-const MCP_AUTH_TOKEN = process.env.MCP_AUTH_TOKEN || "";
+// OAuth 2.1 認証（optional）。有効化するには MCP_OAUTH_USER_NAME と MCP_OAUTH_USER_SECRET
+// と MCP_PUBLIC_BASE_URL を設定する。共用サーバでは未設定のままにして無認証運用を維持。
+const MCP_OAUTH_USER_NAME = process.env.MCP_OAUTH_USER_NAME || "";
+const MCP_OAUTH_USER_SECRET = process.env.MCP_OAUTH_USER_SECRET || "";
+const MCP_PUBLIC_BASE_URL = process.env.MCP_PUBLIC_BASE_URL || "";
 
 if (!DISCORD_TOKEN) {
   console.error("DISCORD_TOKEN environment variable is not set");
@@ -977,6 +984,104 @@ async function startHttp() {
   app.use(cors());
 
   app.use(express.json());
+  app.use(express.urlencoded({ extended: false }));
+
+  // ─── OAuth 2.1 Authorization Server (optional) ─────────
+  // 有効化時:
+  //   - /authorize, /token, /register, /.well-known/* を提供
+  //   - /mcp ルートは Bearer Token 必須
+  //   - /authorize/confirm は pre-shared secret を検証してコード発行
+  const oauthEnabled = !!(
+    MCP_OAUTH_USER_NAME &&
+    MCP_OAUTH_USER_SECRET &&
+    MCP_PUBLIC_BASE_URL
+  );
+  let oauthProvider: InMemoryOAuthProvider | null = null;
+  let resourceMetadataUrl: string | undefined;
+
+  if (oauthEnabled) {
+    oauthProvider = new InMemoryOAuthProvider({
+      userName: MCP_OAUTH_USER_NAME,
+      userSecret: MCP_OAUTH_USER_SECRET,
+      publicBaseUrl: MCP_PUBLIC_BASE_URL,
+    });
+
+    const issuerUrl = new URL(MCP_PUBLIC_BASE_URL);
+    // MCP エンドポイントは Claude 側から見ると MCP_PUBLIC_BASE_URL 自体（nginx で /mcp に rewrite）
+    const resourceServerUrl = new URL(MCP_PUBLIC_BASE_URL);
+    resourceMetadataUrl =
+      MCP_PUBLIC_BASE_URL + "/.well-known/oauth-protected-resource";
+
+    // MCP サーバが path-prefix 配下（nginx rewrite 経由）の場合、SDK の metadata
+    // ハンドラは prefix を落とした絶対URLを返してしまうため、こちらで上書きする。
+    // RFC 8414 / 9728 path-based fallback（ホストルート配下のwell-known + プレフィックス）
+    // にも対応するため、任意のサフィックスを許容する正規表現マッチにする。
+    const asMetadataHandler = (_req: express.Request, res: express.Response) => {
+      res.json({
+        issuer: MCP_PUBLIC_BASE_URL,
+        authorization_endpoint: `${MCP_PUBLIC_BASE_URL}/authorize`,
+        token_endpoint: `${MCP_PUBLIC_BASE_URL}/token`,
+        registration_endpoint: `${MCP_PUBLIC_BASE_URL}/register`,
+        response_types_supported: ["code"],
+        code_challenge_methods_supported: ["S256"],
+        grant_types_supported: ["authorization_code", "refresh_token"],
+        scopes_supported: [],
+        token_endpoint_auth_methods_supported: ["none"],
+      });
+    };
+    const rsMetadataHandler = (_req: express.Request, res: express.Response) => {
+      res.json({
+        resource: MCP_PUBLIC_BASE_URL,
+        authorization_servers: [MCP_PUBLIC_BASE_URL],
+        scopes_supported: [],
+        resource_name: `Discord MCP (${MCP_OAUTH_USER_NAME})`,
+      });
+    };
+    app.get(/^\/\.well-known\/oauth-authorization-server(\/.*)?$/, asMetadataHandler);
+    app.get(/^\/\.well-known\/oauth-protected-resource(\/.*)?$/, rsMetadataHandler);
+    app.get(/^\/\.well-known\/openid-configuration(\/.*)?$/, asMetadataHandler);
+
+    app.use(
+      mcpAuthRouter({
+        provider: oauthProvider,
+        issuerUrl,
+        baseUrl: issuerUrl,
+        resourceServerUrl,
+        resourceName: `Discord MCP (${MCP_OAUTH_USER_NAME})`,
+        scopesSupported: [],
+      })
+    );
+
+    // Pre-shared-secret 確認エンドポイント（ログインフォームの POST 先）
+    app.post("/authorize/confirm", async (req, res) => {
+      const sessionId = String(req.body?.session || "");
+      const secret = String(req.body?.secret || "");
+      const result = await oauthProvider!.handleAuthorizeConfirm(
+        sessionId,
+        secret
+      );
+      if (result.ok && result.redirectUrl) {
+        res.redirect(302, result.redirectUrl);
+        return;
+      }
+      res.status(400).setHeader("Content-Type", "text/html; charset=utf-8").send(`
+<!doctype html>
+<html lang="ja">
+<head><meta charset="utf-8"><title>認証エラー</title>
+<style>body{font-family:-apple-system,sans-serif;max-width:420px;margin:80px auto;padding:0 24px}h1{font-size:16px;color:#b02a1b}a{color:#8c6d1f;font-size:13px}</style>
+</head>
+<body><h1>認証失敗</h1><p>${result.error || "unknown error"}</p><p><a href="javascript:history.back()">戻る</a></p></body>
+</html>`);
+    });
+
+    console.error(
+      `[oauth] ENABLED for user=${MCP_OAUTH_USER_NAME} issuer=${issuerUrl.toString()}`
+    );
+  } else {
+    console.error(
+      "[oauth] DISABLED — /mcp is open (no auth). Set MCP_OAUTH_USER_NAME / _SECRET / MCP_PUBLIC_BASE_URL to enable."
+    );
+  }
 
   // Fix: claude.ai Web sends Accept: application/json only,
   // but MCP SDK requires both application/json and text/event-stream.
@@ -1008,27 +1113,16 @@ async function startHttp() {
     res.json({ status: "ok", transport: "http", discord: client.isReady() });
   });
 
-  // Bearer token auth on /mcp routes only.
-  // When MCP_AUTH_TOKEN is empty, auth is disabled (backward compat for shared bots).
-  // When set, all /mcp requests must present Authorization: Bearer <token>.
-  if (MCP_AUTH_TOKEN) {
-    app.use("/mcp", (req, res, next) => {
-      const header = req.headers["authorization"] || "";
-      const match = /^Bearer\s+(.+)$/i.exec(Array.isArray(header) ? header[0] : header);
-      const provided = match ? match[1].trim() : "";
-      if (provided !== MCP_AUTH_TOKEN) {
-        res.status(401).json({
-          jsonrpc: "2.0",
-          error: { code: -32001, message: "Unauthorized: invalid or missing token" },
-          id: (req.body && typeof req.body === "object" && "id" in req.body) ? (req.body as any).id : null,
-        });
-        return;
-      }
-      next();
-    });
-    console.error(`[auth] MCP_AUTH_TOKEN enabled (length=${MCP_AUTH_TOKEN.length})`);
-  } else {
-    console.error(`[auth] MCP_AUTH_TOKEN not set — /mcp is open (no auth)`);
+  // OAuth が有効なら /mcp ルートに requireBearerAuth を適用。
+  // 無効（共用サーバ）なら従来通りノーチェックで通す。
+  if (oauthEnabled && oauthProvider) {
+    app.use(
+      "/mcp",
+      requireBearerAuth({
+        verifier: oauthProvider,
+        resourceMetadataUrl,
+      })
+    );
   }
 
   // ── POST /mcp ──────────────────────────────────────
