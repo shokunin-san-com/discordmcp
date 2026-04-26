@@ -18,6 +18,7 @@ import {
   GatewayIntentBits,
   TextChannel,
   ThreadChannel,
+  ForumChannel,
   User,
   DMChannel,
   Partials,
@@ -149,6 +150,53 @@ async function findChannel(
   throw new Error(
     `Channel "${channelIdentifier}" is not a text channel or not found in server`
   );
+}
+
+type ReadableChannel = TextChannel | ForumChannel | ThreadChannel;
+
+async function findReadableChannel(
+  channelIdentifier: string,
+  guildIdentifier?: string
+): Promise<ReadableChannel> {
+  const guild = await findGuild(guildIdentifier);
+
+  try {
+    const channel = await client.channels.fetch(channelIdentifier);
+    if (channel) {
+      if (
+        (channel instanceof TextChannel ||
+          channel instanceof ForumChannel ||
+          channel instanceof ThreadChannel) &&
+        channel.guild?.id === guild.id
+      ) {
+        return channel;
+      }
+    }
+  } catch {
+    // fall through to name search
+  }
+
+  const matches = guild.channels.cache.filter(
+    (c) =>
+      (c instanceof TextChannel ||
+        c instanceof ForumChannel ||
+        c instanceof ThreadChannel) &&
+      (c.name.toLowerCase() === channelIdentifier.toLowerCase() ||
+        c.name.toLowerCase() ===
+          channelIdentifier.toLowerCase().replace("#", ""))
+  );
+  if (matches.size === 0) {
+    throw new Error(
+      `Readable channel "${channelIdentifier}" not found in server "${guild.name}"`
+    );
+  }
+  if (matches.size > 1) {
+    const list = matches.map((c) => `#${c.name} (${c.id})`).join(", ");
+    throw new Error(
+      `Multiple channels found with name "${channelIdentifier}": ${list}. Please specify the channel ID.`
+    );
+  }
+  return matches.first()! as ReadableChannel;
 }
 
 async function findUser(userIdentifier: string): Promise<User> {
@@ -507,12 +555,47 @@ function createMcpServer(): Server {
         case "read-messages": {
           const { channel: chId, limit, server: srv } =
             ReadMessagesSchema.parse(args);
-          const channel = await findChannel(chId, srv);
+          const channel = await findReadableChannel(chId, srv);
+
+          // ForumChannel: list recent posts (each post is a thread)
+          if (channel instanceof ForumChannel) {
+            const active = await channel.threads.fetchActive();
+            const archived = await channel.threads.fetchArchived({ limit });
+            const all = [
+              ...active.threads.values(),
+              ...archived.threads.values(),
+            ]
+              .sort(
+                (a, b) =>
+                  (b.createdTimestamp ?? 0) - (a.createdTimestamp ?? 0)
+              )
+              .slice(0, limit);
+            const formatted = all.map((t) => ({
+              id: t.id,
+              type: "forum-post",
+              forum: `#${channel.name}`,
+              server: channel.guild.name,
+              name: t.name,
+              archived: t.archived ?? false,
+              messageCount: t.messageCount ?? 0,
+              createdAt: t.createdAt?.toISOString() ?? null,
+            }));
+            return {
+              content: [
+                { type: "text", text: JSON.stringify(formatted, null, 2) },
+              ],
+            };
+          }
+
+          // ThreadChannel or TextChannel: read messages
           const messages = await channel.messages.fetch({ limit });
           const formatted = Array.from(messages.values()).map((msg) => ({
             id: msg.id,
-            channel: `#${channel.name}`,
-            server: channel.guild.name,
+            channel:
+              channel instanceof ThreadChannel
+                ? `#${channel.parent?.name ?? "?"} > ${channel.name}`
+                : `#${channel.name}`,
+            server: channel.guild?.name ?? "",
             author: msg.author.tag,
             authorId: msg.author.id,
             content: msg.content,
@@ -885,35 +968,57 @@ function createMcpServer(): Server {
         case "read-thread": {
           const { channel: chId, thread: threadId, limit, server: srv } =
             ReadThreadSchema.parse(args);
-          const channel = await findChannel(chId, srv);
 
-          // Fetch active threads
-          const activeThreads = await channel.threads.fetchActive();
-          const archivedThreads = await channel.threads.fetchArchived();
-          const allThreads = [
-            ...activeThreads.threads.values(),
-            ...archivedThreads.threads.values(),
-          ];
-
-          // Find thread by ID or name
-          const thread = allThreads.find(
-            (t) =>
-              t.id === threadId ||
-              t.name.toLowerCase() === threadId.toLowerCase()
-          );
-
-          if (!thread) {
-            const available = allThreads.map((t) => `"${t.name}" (${t.id})`).join(", ");
-            throw new Error(
-              `Thread "${threadId}" not found in #${channel.name}. Available threads: ${available || "none"}`
-            );
+          // 1) Try direct fetch by thread ID (works for forum posts too)
+          let thread: ThreadChannel | null = null;
+          try {
+            const fetched = await client.channels.fetch(threadId);
+            if (fetched instanceof ThreadChannel) {
+              thread = fetched;
+            }
+          } catch {
+            // fall through
           }
 
+          // 2) Fallback: search active/archived threads under parent channel
+          if (!thread) {
+            const parent = await findReadableChannel(chId, srv);
+            if (
+              !(parent instanceof TextChannel) &&
+              !(parent instanceof ForumChannel)
+            ) {
+              throw new Error(
+                `Channel "${chId}" cannot host threads (got ${parent.constructor.name})`
+              );
+            }
+            const active = await parent.threads.fetchActive();
+            const archived = await parent.threads.fetchArchived();
+            const all = [
+              ...active.threads.values(),
+              ...archived.threads.values(),
+            ];
+            const found = all.find(
+              (t) =>
+                t.id === threadId ||
+                t.name.toLowerCase() === threadId.toLowerCase()
+            );
+            if (!found) {
+              const available = all
+                .map((t) => `"${t.name}" (${t.id})`)
+                .join(", ");
+              throw new Error(
+                `Thread "${threadId}" not found in #${parent.name}. Available threads: ${available || "none"}`
+              );
+            }
+            thread = found;
+          }
+
+          const parentName = thread.parent?.name ?? "?";
           const messages = await thread.messages.fetch({ limit });
           const formatted = Array.from(messages.values()).map((msg) => ({
             id: msg.id,
-            thread: thread.name,
-            channel: `#${channel.name}`,
+            thread: thread!.name,
+            channel: `#${parentName}`,
             author: msg.author.tag,
             authorId: msg.author.id,
             content: msg.content,
@@ -1004,6 +1109,9 @@ async function startHttp() {
       userName: MCP_OAUTH_USER_NAME,
       userSecret: MCP_OAUTH_USER_SECRET,
       publicBaseUrl: MCP_PUBLIC_BASE_URL,
+      persistPath:
+        process.env.MCP_OAUTH_PERSIST_PATH ||
+        `${process.cwd()}/data/oauth-state.json`,
     });
 
     const issuerUrl = new URL(MCP_PUBLIC_BASE_URL);
