@@ -318,6 +318,14 @@ const ListMembersSchema = z.object({
   limit: z.number().min(1).max(100).default(50),
 });
 
+const CreateThreadSchema = z.object({
+  server: z.string().optional().describe("Server name or ID"),
+  channel: z.string().describe("Forum channel name or ID (must be a forum channel)"),
+  name: z.string().min(1).max(100).describe("Thread (forum post) name / title (max 100 chars)"),
+  message: z.string().describe("Initial message content for the thread"),
+  sender_name: z.string().optional().describe("Override sender name for this initial message"),
+});
+
 // ─── MCP Server Factory ─────────────────────────────────
 
 function createMcpServer(): Server {
@@ -519,6 +527,21 @@ function createMcpServer(): Server {
           required: [],
         },
       },
+      {
+        name: "create-thread",
+        description: "Create a new thread (forum post) in a Discord forum channel with an initial message",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            server: { type: "string", description: "Server name or ID (optional)" },
+            channel: { type: "string", description: "Forum channel name or ID (must be a forum channel)" },
+            name: { type: "string", description: "Thread/post name (max 100 chars)" },
+            message: { type: "string", description: "Initial message content for the thread" },
+            sender_name: { type: "string", description: "Override sender name for this initial message (optional)" },
+          },
+          required: ["channel", "name", "message"],
+        },
+      },
     ],
   }));
 
@@ -532,20 +555,29 @@ function createMcpServer(): Server {
         case "send-message": {
           const { channel: chId, message, sender_name, server: srv, reply_to } =
             SendMessageSchema.parse(args);
-          const channel = await findChannel(chId, srv);
+          const target = await findReadableChannel(chId, srv);
+          if (target instanceof ForumChannel) {
+            throw new Error(
+              `Cannot send-message to forum channel "#${target.name}" directly. Specify a thread (post) ID instead.`
+            );
+          }
           const finalMsg = prependSenderName(message, sender_name);
           let sent;
           if (reply_to) {
-            const targetMsg = await channel.messages.fetch(reply_to);
+            const targetMsg = await target.messages.fetch(reply_to);
             sent = await targetMsg.reply(finalMsg);
           } else {
-            sent = await channel.send(finalMsg);
+            sent = await target.send(finalMsg);
           }
+          const channelLabel =
+            target instanceof ThreadChannel
+              ? `#${target.parent?.name ?? "?"} > ${target.name}`
+              : `#${target.name}`;
           return {
             content: [
               {
                 type: "text",
-                text: `Message sent to #${channel.name} in ${channel.guild.name}. Message ID: ${sent.id}`,
+                text: `Message sent to ${channelLabel} in ${target.guild?.name ?? ""}. Message ID: ${sent.id}`,
               },
             ],
           };
@@ -1026,6 +1058,31 @@ function createMcpServer(): Server {
           }));
           return {
             content: [{ type: "text", text: JSON.stringify(formatted, null, 2) }],
+          };
+        }
+
+        // ── create-thread ────────────────────────
+        case "create-thread": {
+          const { channel: chId, name: threadName, message: msg, sender_name, server: srv } =
+            CreateThreadSchema.parse(args);
+          const target = await findReadableChannel(chId, srv);
+          if (!(target instanceof ForumChannel)) {
+            throw new Error(
+              `Channel "#${target.name}" is not a forum channel. create-thread is only supported on forum channels.`
+            );
+          }
+          const finalMsg = prependSenderName(msg, sender_name);
+          const post = await target.threads.create({
+            name: threadName,
+            message: { content: finalMsg },
+          });
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Forum post created in #${target.name}: thread ID ${post.id}, name "${threadName}"`,
+              },
+            ],
           };
         }
 
