@@ -21,6 +21,14 @@ A Model Context Protocol (MCP) server that enables LLMs to interact with Discord
 
 ## Setup
 
+### Team remote setup guides
+
+- [Claude setup guide](docs/setup-new-member.md)
+- [Codex setup guide (macOS / Windows)](docs/setup-codex-new-member.md)
+
+The team remote endpoint is `https://lp.shokunin-san.xyz/mcp`. Team members using
+the remote endpoint do not need a local clone, Node.js, or a Discord Bot Token.
+
 1. Clone this repository:
 ```bash
 git clone https://github.com/yourusername/discordmcp.git
