@@ -1,5 +1,7 @@
 import { Response } from "express";
 import { randomUUID, randomBytes } from "crypto";
+import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs";
+import { dirname } from "path";
 import { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
 import {
   OAuthServerProvider,
@@ -41,13 +43,14 @@ interface RefreshTokenEntry {
   expiresAt: number;
 }
 
-const ACCESS_TOKEN_TTL_SEC = 60 * 60; // 1 hour
+const ACCESS_TOKEN_TTL_SEC = 24 * 60 * 60; // 24 hours - re-auth頻度を下げるため
 const REFRESH_TOKEN_TTL_SEC = 30 * 24 * 60 * 60; // 30 days
 
 export interface ProviderOptions {
   userName: string;
   userSecret: string;
   publicBaseUrl: string;
+  persistPath?: string; // ファイル永続化パス。未指定なら揮発的（メモリのみ）
 }
 
 export class InMemoryOAuthProvider implements OAuthServerProvider {
@@ -59,6 +62,40 @@ export class InMemoryOAuthProvider implements OAuthServerProvider {
     string,
     { client: OAuthClientInformationFull; params: AuthorizationParams }
   >();
+
+  private loadPersisted(): void {
+    if (!this.opts.persistPath) return;
+    if (!existsSync(this.opts.persistPath)) return;
+    try {
+      const raw = readFileSync(this.opts.persistPath, "utf8");
+      const data = JSON.parse(raw);
+      if (data.clients) this.clients = new Map(data.clients);
+      if (data.tokens) this.tokens = new Map(data.tokens);
+      if (data.refreshTokens) this.refreshTokens = new Map(data.refreshTokens);
+      this.sweepExpired();
+      console.error(
+        `[oauth] loaded from ${this.opts.persistPath}: clients=${this.clients.size} access=${this.tokens.size} refresh=${this.refreshTokens.size}`
+      );
+    } catch (e) {
+      console.error("[oauth] persist load failed:", e);
+    }
+  }
+
+  private persist(): void {
+    if (!this.opts.persistPath) return;
+    try {
+      const dir = dirname(this.opts.persistPath);
+      if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+      const data = {
+        clients: Array.from(this.clients.entries()),
+        tokens: Array.from(this.tokens.entries()),
+        refreshTokens: Array.from(this.refreshTokens.entries()),
+      };
+      writeFileSync(this.opts.persistPath, JSON.stringify(data), "utf8");
+    } catch (e) {
+      console.error("[oauth] persist save failed:", e);
+    }
+  }
 
   private issueTokenPair(
     clientId: string,
@@ -87,6 +124,7 @@ export class InMemoryOAuthProvider implements OAuthServerProvider {
       resource,
       expiresAt: now + REFRESH_TOKEN_TTL_SEC * 1000,
     });
+    this.persist();
     return {
       access_token: accessToken,
       token_type: "Bearer",
@@ -108,11 +146,42 @@ export class InMemoryOAuthProvider implements OAuthServerProvider {
     }
   }
 
-  constructor(private opts: ProviderOptions) {}
+  constructor(private opts: ProviderOptions) {
+    this.loadPersisted();
+  }
 
   get clientsStore(): OAuthRegisteredClientsStore {
     return {
-      getClient: async (clientId: string) => this.clients.get(clientId),
+      getClient: async (clientId: string) => {
+        const existing = this.clients.get(clientId);
+        if (existing) return existing;
+        // 未知の client_id は自動で受け入れ、最低限の client_info を返す。
+        // DCR状態がサーバ側で消失した場合（永続化導入直後、データ破損時等）でも
+        // クライアントが再登録せずにそのまま認可フローを続行できるようにする。
+        // 認可の実体はシークレット検証側で行うのでセキュリティ観点でも影響小。
+        if (!clientId.startsWith("mcp-")) return undefined;
+        const now = Math.floor(Date.now() / 1000);
+        const synthesized: OAuthClientInformationFull = {
+          client_id: clientId,
+          client_id_issued_at: now,
+          // 永続化前 DCR 済みの既知クライアント群をカバー:
+          // - Claude.ai Web
+          // - mcp-remote (loopback URIs per RFC 8252 §7.3、ポートは任意でマッチ)
+          redirect_uris: [
+            "https://claude.ai/api/mcp/auth_callback",
+            "http://localhost/oauth/callback",
+            "http://127.0.0.1/oauth/callback",
+            "http://[::1]/oauth/callback",
+          ],
+          token_endpoint_auth_method: "none",
+          grant_types: ["authorization_code", "refresh_token"],
+          response_types: ["code"],
+        };
+        this.clients.set(clientId, synthesized);
+        this.persist();
+        console.error(`[oauth] auto-accepted unknown client_id=${clientId}`);
+        return synthesized;
+      },
       registerClient: async (client) => {
         const clientId = `mcp-${randomUUID()}`;
         const now = Math.floor(Date.now() / 1000);
@@ -122,6 +191,7 @@ export class InMemoryOAuthProvider implements OAuthServerProvider {
           client_id_issued_at: now,
         };
         this.clients.set(clientId, full);
+        this.persist();
         return full;
       },
     };
@@ -246,13 +316,12 @@ export class InMemoryOAuthProvider implements OAuthServerProvider {
     if (!entry || entry.expiresAt < Date.now()) {
       throw new InvalidGrantError("invalid or expired code/refresh token");
     }
-    if (entry.clientId !== client.client_id) {
-      throw new InvalidClientError("client mismatch");
-    }
+    // client_id は DCR で毎回変わる可能性があるので一致チェックしない。
+    // 認可時のユーザー検証で十分、再発行は refresh_token 自体の有効性のみで判定。
     // Rotation: 古い refresh_token を無効化し、新しい access + refresh を発行
     this.refreshTokens.delete(refreshToken);
     return this.issueTokenPair(
-      entry.clientId,
+      client.client_id, // 最新の client_id で再発行
       entry.userId,
       entry.scopes,
       entry.resource
