@@ -24,6 +24,7 @@
     "discord.js": "^14.14.1",
     "dotenv": "^16.4.7",
     "express": "^5.2.1",
+    "jszip": "^3.10.1",
     "mammoth": "^1.12.0",
     "pdf-parse": "^1.1.1",
     "xlsx": "^0.18.5",
@@ -32,6 +33,7 @@
   "devDependencies": {
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
+    "@types/jszip": "^3.4.0",
     "@types/node": "^20.11.16",
     "@types/pdf-parse": "^1.1.5",
     "typescript": "^5.3.3"
