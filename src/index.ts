@@ -1221,9 +1221,13 @@ async function startHttp() {
     app.post("/authorize/confirm", async (req, res) => {
       const sessionId = String(req.body?.session || "");
       const secret = String(req.body?.secret || "");
+      // nginx の X-Forwarded-For の最後（nginx が見た相手）を使う。直接来たときは接続元
+      const xff = String(req.headers["x-forwarded-for"] || "").split(",").map((x) => x.trim()).filter(Boolean);
+      const clientIp = xff.length ? xff[xff.length - 1] : (req.socket.remoteAddress || "unknown");
       const result = await oauthProvider!.handleAuthorizeConfirm(
         sessionId,
-        secret
+        secret,
+        clientIp
       );
       if (result.ok && result.redirectUrl) {
         res.redirect(302, result.redirectUrl);
