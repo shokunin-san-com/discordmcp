@@ -1,5 +1,5 @@
 import { Response } from "express";
-import { randomUUID, randomBytes } from "crypto";
+import { randomUUID, randomBytes, createHash, timingSafeEqual } from "crypto";
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "fs";
 import { dirname } from "path";
 import { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
@@ -16,6 +16,8 @@ import {
   InvalidGrantError,
   InvalidClientError,
   InvalidTokenError,
+  InvalidClientMetadataError,
+  InvalidRequestError,
 } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 
 interface AuthCodeEntry {
@@ -43,6 +45,43 @@ interface RefreshTokenEntry {
   expiresAt: number;
 }
 
+// ---------------------------------------------------------------------------
+// 戻り先（redirect_uri）の許可リスト（2026-11-16）
+// 以前は /register で誰でも好きな戻り先を登録でき、そのリンクでシークレットを
+// 入れさせると認可コードが攻撃者のサイトへ送られる作りだった。
+// 許すのは Claude の公式のコールバックと、自分の PC（loopback・ポートは任意）だけ。
+// 追加が要るときは MCP_OAUTH_EXTRA_REDIRECT_URIS にカンマ区切りで完全一致の URI を書く。
+// ---------------------------------------------------------------------------
+const ALLOWED_REDIRECT_URIS = new Set<string>([
+  "https://claude.ai/api/mcp/auth_callback",
+  "https://claude.com/api/mcp/auth_callback",
+  ...(process.env.MCP_OAUTH_EXTRA_REDIRECT_URIS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
+]);
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
+
+export function isAllowedRedirectUri(uri: string): boolean {
+  if (ALLOWED_REDIRECT_URIS.has(uri)) return true;
+  try {
+    const u = new URL(uri);
+    // RFC 8252 §7.3：自分の PC へのループバックは http・任意のポートを許す
+    return u.protocol === "http:" && LOOPBACK_HOSTS.has(u.hostname) && !u.username && !u.password;
+  } catch {
+    return false;
+  }
+}
+
+// シークレットの入力の回数制限（総当たり対策）
+const CONFIRM_WINDOW_MS = 15 * 60 * 1000;
+const CONFIRM_MAX_FAILS_PER_IP = 5;
+const CONFIRM_MAX_FAILS_TOTAL = 30;
+
+function sha256(s: string): Buffer {
+  return createHash("sha256").update(s, "utf8").digest();
+}
+
 const ACCESS_TOKEN_TTL_SEC = 24 * 60 * 60; // 24 hours - re-auth頻度を下げるため
 const REFRESH_TOKEN_TTL_SEC = 30 * 24 * 60 * 60; // 30 days
 
@@ -58,6 +97,7 @@ export class InMemoryOAuthProvider implements OAuthServerProvider {
   private codes = new Map<string, AuthCodeEntry>();
   private tokens = new Map<string, AccessTokenEntry>();
   private refreshTokens = new Map<string, RefreshTokenEntry>();
+  private confirmFails: { ip: string; at: number }[] = [];
   private pending = new Map<
     string,
     { client: OAuthClientInformationFull; params: AuthorizationParams }
@@ -183,6 +223,12 @@ export class InMemoryOAuthProvider implements OAuthServerProvider {
         return synthesized;
       },
       registerClient: async (client) => {
+        const uris = client.redirect_uris || [];
+        const bad = uris.filter((u) => !isAllowedRedirectUri(String(u)));
+        if (uris.length === 0 || bad.length > 0) {
+          console.error(`[oauth] rejected client registration redirect_uris=${JSON.stringify(uris)}`);
+          throw new InvalidClientMetadataError("redirect_uri is not allowed");
+        }
         const clientId = `mcp-${randomUUID()}`;
         const now = Math.floor(Date.now() / 1000);
         const full: OAuthClientInformationFull = {
@@ -202,6 +248,18 @@ export class InMemoryOAuthProvider implements OAuthServerProvider {
     params: AuthorizationParams,
     res: Response
   ): Promise<void> {
+    // 登録済みのクライアントでも、許可リスト外の戻り先には進ませない（念のための二重の確認）
+    if (!isAllowedRedirectUri(params.redirectUri)) {
+      console.error(`[oauth] rejected authorize redirect_uri=${params.redirectUri}`);
+      throw new InvalidRequestError("redirect_uri is not allowed");
+    }
+    const redirectHost = (() => {
+      try {
+        return new URL(params.redirectUri).host;
+      } catch {
+        return params.redirectUri;
+      }
+    })();
     const sessionId = randomUUID();
     this.pending.set(sessionId, { client, params });
     setTimeout(() => this.pending.delete(sessionId), 10 * 60 * 1000);
@@ -228,6 +286,7 @@ export class InMemoryOAuthProvider implements OAuthServerProvider {
 <body>
   <h1>Discord MCP 認証</h1>
   <p class="sub">ユーザー: <strong>${this.opts.userName}</strong> / クライアント: <span class="client">${escapeHtml(client.client_name || client.client_id)}</span></p>
+  <p class="sub">認証のあとの戻り先: <strong>${escapeHtml(redirectHost)}</strong><br>Claude から自分で始めた接続のときだけ入力してください。届いたリンクから開いた画面には入力しないでください。</p>
   <form method="POST" action="${this.opts.publicBaseUrl}/authorize/confirm">
     <input type="hidden" name="session" value="${sessionId}">
     <label for="secret">アクセスシークレット</label>
@@ -243,13 +302,24 @@ export class InMemoryOAuthProvider implements OAuthServerProvider {
 
   async handleAuthorizeConfirm(
     sessionId: string,
-    secret: string
+    secret: string,
+    clientIp = "unknown"
   ): Promise<{ ok: boolean; redirectUrl?: string; error?: string }> {
+    const now = Date.now();
+    this.confirmFails = this.confirmFails.filter((f) => now - f.at < CONFIRM_WINDOW_MS);
+    const ipFails = this.confirmFails.filter((f) => f.ip === clientIp).length;
+    if (ipFails >= CONFIRM_MAX_FAILS_PER_IP || this.confirmFails.length >= CONFIRM_MAX_FAILS_TOTAL) {
+      console.error(`[oauth] confirm rate-limited ip=${clientIp} ipFails=${ipFails} total=${this.confirmFails.length}`);
+      return { ok: false, error: "失敗が続いたため、しばらく受け付けを止めています。15分ほど待ってからやり直してください。" };
+    }
     const pending = this.pending.get(sessionId);
     if (!pending) {
       return { ok: false, error: "セッションの有効期限が切れました。Claude からやり直してください。" };
     }
-    if (secret !== this.opts.userSecret) {
+    // 長さや中身で比べる時間が変わらないよう、ハッシュにしてから一定時間で比べる
+    if (!timingSafeEqual(sha256(secret), sha256(this.opts.userSecret))) {
+      this.confirmFails.push({ ip: clientIp, at: now });
+      console.error(`[oauth] confirm failed ip=${clientIp}`);
       return { ok: false, error: "シークレットが一致しません。" };
     }
     this.pending.delete(sessionId);
